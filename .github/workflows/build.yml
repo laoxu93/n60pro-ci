@@ -23,9 +23,9 @@ on:
         required: false
         default: "mt7986"
       device_filter:
-        description: "机型名正则（默认 S20P/S20L + 3 个 MTK U-Boot 变体；.* = 全部机型）"
+        description: "机型名正则（默认只编 netcore_n60-pro 标准版 + mtkuboot 版）"
         required: false
-        default: "clx_s20[pl]|mtkuboot$"
+        default: "netcore_n60-pro"
       device_slice:
         description: "分批编译，格式 1/3（第1批共3批）。留空=全部一起编"
         required: false
@@ -48,7 +48,7 @@ env:
   # （netcore_n60-pro / ruijie_rg-x60-new / xiaomi_redmi-router-ax6000）
   # S20M 无无线不编；填 .* 或不加过滤则编该芯片下全部 56 个 7986 机型
   # （其中部分设备 WiFi 组合/分区布局与这份高功率源码不匹配，编不过）
-  DEVICE_FILTER: ${{ github.event.inputs.device_filter || 'clx_s20[pl]|mtkuboot$' }}
+  DEVICE_FILTER: ${{ github.event.inputs.device_filter || 'netcore_n60-pro' }}
   # 分批，例如 1/3；留空表示全部
   DEVICE_SLICE: ${{ github.event.inputs.device_slice || '' }}
   # 填了就从外部源下载 .config，留空则用 configs/packages.config
@@ -57,7 +57,7 @@ env:
 
 jobs:
   build:
-    name: "编译 ${{ github.event.inputs.branch || 'n60pro-high-power' }} [${{ github.event.inputs.chip_filter || 'mt7986' }}] ${{ github.event.inputs.device_filter || 'clx_s20+3mtkuboot' }}"
+    name: "编译 ${{ github.event.inputs.branch || 'n60pro-high-power' }} [${{ github.event.inputs.chip_filter || 'mt7986' }}] ${{ github.event.inputs.device_filter || 'n60pro' }}"
     runs-on: ubuntu-22.04
     timeout-minutes: 355
 
@@ -227,6 +227,86 @@ jobs:
               | sed -E 's/^CONFIG_TARGET_DEVICE_[a-z0-9]+_[a-z0-9]+_DEVICE_//; s/=y$//' | sort > /tmp/got.txt
             comm -23 /tmp/want.txt /tmp/got.txt | sed 's/^/  缺失: /' || true
           fi
+
+      - name: 定制默认参数（LAN IP / 主机名 / 时区 / 端口）
+        run: |
+          cd openwrt
+          LAN_IP="192.168.5.1"
+          HOSTNAME="N60Pro"
+          TZ="CST-8"
+
+          # ---------- 1. 默认 LAN IP ----------
+          if [ -f package/base-files/files/bin/config_generate ]; then
+            sed -i "s/192\.168\.1\.1/${LAN_IP}/g" package/base-files/files/bin/config_generate
+            sed -i "s/timezone='UTC'/timezone='${TZ}'/" package/base-files/files/bin/config_generate
+            sed -i "s/hostname='ImmortalWrt'/hostname='${HOSTNAME}'/" package/base-files/files/bin/config_generate
+            sed -i "s/hostname='OpenWrt'/hostname='${HOSTNAME}'/" package/base-files/files/bin/config_generate
+            echo "config_generate 已改: LAN=${LAN_IP} host=${HOSTNAME} tz=${TZ}"
+            grep -n "lan) ipad=|timezone=|hostname=" package/base-files/files/bin/config_generate | head -8 || true
+          else
+            echo "::warning::config_generate 不存在, 跳过 IP 修改"
+          fi
+
+          # 第三方包 uci-defaults 里写死的 192.168.1.1
+          grep -rl '192\.168\.1\.1' package/feeds/*/luci-app-*/root/etc/uci-defaults/ 2>/dev/null \
+            | xargs -r sed -i "s/192\.168\.1\.1/${LAN_IP}/g" 2>/dev/null || true
+
+          # ---------- 2. AdGuardHome / OpenClash 端口错开 ----------
+          # 两者默认都抢 53 端口, 不错开刷完必断网
+          mkdir -p package/base-files/files/etc/uci-defaults
+          cat > package/base-files/files/etc/uci-defaults/99-adguard-openclash-compat << 'UCIEOF'
+          #!/bin/sh
+          # AdGuardHome: Web 面板 3000, DNS 监听 5353 (避开 53)
+          if [ -f /etc/config/AdGuardHome ]; then
+            uci -q set AdGuardHome.AdGuardHome.port='3000'
+            uci -q set AdGuardHome.AdGuardHome.dns_port='5353'
+            uci -q commit AdGuardHome
+          fi
+          # OpenClash: 自定义 DNS 上游指向 AdGuardHome
+          if [ -f /etc/config/openclash ]; then
+            uci -q set openclash.config.enable_custom_dns='1'
+            uci -q set openclash.config.custom_dns_server='127.0.0.1:5353'
+            uci -q commit openclash
+          fi
+          exit 0
+          UCIEOF
+          chmod +x package/base-files/files/etc/uci-defaults/99-adguard-openclash-compat
+
+          # ---------- 3. OpenClash 首次开机默认关闭 ----------
+          # 避免节点没配好就接管全部流量导致刷机后失联
+          cat > package/base-files/files/etc/uci-defaults/98-openclash-off << 'UCIEOF'
+          #!/bin/sh
+          if [ -f /etc/config/openclash ]; then
+            uci -q set openclash.config.enable='0'
+            uci -q commit openclash
+          fi
+          exit 0
+          UCIEOF
+          chmod +x package/base-files/files/etc/uci-defaults/98-openclash-off
+
+          echo "定制脚本已写入"
+
+      - name: 校验关键插件是否真的进了配置
+        run: |
+          cd openwrt
+          FAIL=0
+          for p in luci-app-openclash dnsmasq-full luci-app-lucky luci-app-adguardhome; do
+            if grep -qxF "CONFIG_PACKAGE_${p}=y" .config; then
+              echo "OK   ${p}"
+            else
+              echo "::error::${p} 未进入 .config"
+              echo "     现状: $(grep -E "^CONFIG_PACKAGE_${p}=" .config || echo '（符号不存在，包没被识别）')"
+              echo "     源码是否存在: $(find package feeds -maxdepth 5 -type d -name "${p}" 2>/dev/null | head -1 || echo '不存在')"
+              FAIL=1
+            fi
+          done
+          # dnsmasq 与 dnsmasq-full 互斥
+          if grep -qxF "CONFIG_PACKAGE_dnsmasq=y" .config; then
+            echo "::error::dnsmasq 与 dnsmasq-full 同时启用，会冲突"
+            FAIL=1
+          fi
+          [ "$FAIL" = "1" ] && exit 1
+          echo "=== 插件校验全部通过 ==="
 
       - name: 校验替换结果
         run: |
