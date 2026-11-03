@@ -428,22 +428,32 @@ jobs:
           # GitHub 用 bash -e 跑脚本，配 pipefail 时 make 一失败整个步骤就中断，
           # 后面的优雅处理全是死代码（上一次编译就是这么把 exit code 2 交上去的）。
           rc=0
-          make -j"$(nproc)" -k 2>&1 | tee build.log | tail -n 150 || rc=$?
+          # 完整日志落盘, 控制台只显示尾部, 避免 tail 截断后无法定位错误
+          make -j"$(nproc)" -k V=s > build-full.log 2>&1 || rc=$?
+          tail -n 150 build-full.log
           n="$(find bin/targets -type f -name '*sysupgrade*' 2>/dev/null | wc -l)"
           echo "make 退出码=${rc}，已产出 sysupgrade 固件 ${n} 个"
           echo "----- 编译后磁盘 -----"
           df -h /
           if [ "${rc}" -ne 0 ]; then
-            echo "----- 失败摘要 -----"
-            grep -nE 'ERROR:|Error [0-9]+|error:|No space' build.log | tail -30 || true
-            # 并行编译会吞掉真实错误（toplevel.mk 的 WARN_PARALLEL_ERROR 机制），
-            # 按官方提示用 -j1 V=s 重跑内核编译，把真正的错误暴露出来。
-            # make 会跳过已编好的部分，只重编失败的内核，不会从头再来。
-            echo "----- 用 -j1 V=s 重跑内核编译，抓真实错误 -----"
+            echo "----- build-full.log 里的错误 -----"
+            grep -nE 'ERROR:|Error [0-9]+|error:|No space|check-size|too big|exceed' build-full.log | tail -60 || true
+            echo "----- 失败包前后各 15 行 -----"
+            for pat in 'ERROR: package' 'check-size' 'No space left'; do
+              ln="$(grep -n "$pat" build-full.log | tail -1 | cut -d: -f1)"
+              if [ -n "$ln" ]; then
+                echo "### 关键字 $pat @ 行 $ln"
+                sed -n "$((ln>15?ln-15:1)),$((ln+15))p" build-full.log
+              fi
+            done
+            # 单线程重跑失败的那部分, 把被并行吞掉的真实错误完整暴露
+            echo "----- -j1 V=s 单线程重跑, 抓真实错误 -----"
             rc2=0
-            make target/linux/compile -j1 V=s > kernel-retry.log 2>&1 || rc2=$?
-            echo "内核重跑退出码=${rc2}"
-            tail -n 300 kernel-retry.log
+            make -j1 V=s > kernel-retry.log 2>&1 || rc2=$?
+            echo "单线程重跑退出码=${rc2}"
+            echo "----- 单线程日志错误 -----"
+            grep -nE 'ERROR:|Error [0-9]+|error:|No space|check-size|too big|exceed' kernel-retry.log | tail -40 || true
+            tail -n 120 kernel-retry.log
           fi
           if [ "${n:-0}" -eq 0 ]; then
             echo "::error::一个固件都没产出，编译彻底失败"
