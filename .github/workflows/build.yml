@@ -231,7 +231,7 @@ jobs:
       - name: 定制默认参数（LAN IP / 主机名 / 时区 / 端口）
         run: |
           cd openwrt
-          LAN_IP="192.168.5.1"
+          LAN_IP="192.168.6.1"
           HOSTNAME="N60Pro"
           TZ="CST-8"
 
