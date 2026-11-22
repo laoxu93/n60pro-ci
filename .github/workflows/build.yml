@@ -125,6 +125,19 @@ jobs:
           # 提前把取值写进 subtarget 内核配置文件即可。
           bash ../scripts/patch-kernel-symbols.sh
 
+
+      - name: 修补 rust 包（修掉 rust [host] 编译失败）
+        run: |
+          cd openwrt
+          # feeds/packages/lang/rust 是 HOST 包，编译它要跑 rustc 的 x.py bootstrap。
+          # bootstrap 默认 download-ci-llvm=true 去拉 rust 官方 CI 预编译的 LLVM，
+          # 而 rust 1.96.0 的 CI LLVM 产物已被 Rust 官方定期清理删档，导致：
+          #   Bootstrap failed while executing `--ci false --build-dir .../rustc-1.96.0-src/build ...`
+          #   ERROR: package/feeds/packages/rust [host] failed to build.
+          # 上游 openwrt/packages master 已修（1.96.1 + download-ci-llvm=false），
+          # 但 feeds 用的 immortalwrt/packages openwrt-25.12 分支还没同步，这里补上。
+          bash ../scripts/patch-rust.sh
+
       - name: 准备基础配置
         run: |
           mkdir -p work
